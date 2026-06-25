@@ -1,8 +1,13 @@
-"""arXiv search via the Atom-format query API. No key required."""
+"""arXiv search via the Atom-format query API. No key required.
+
+Retries up to 3 times on network errors (timeout, DNS failure, connection refused).
+Returns [] after all retries exhausted — no exception propagates to the caller.
+"""
 
 from __future__ import annotations
 
 import re
+import time
 import xml.etree.ElementTree as ET
 from typing import Optional
 
@@ -23,19 +28,51 @@ def _text(el: Optional[ET.Element]) -> str:
     return (el.text or "").strip() if el is not None and el.text else ""
 
 
+def _fetch_with_retry(params: dict, retries: int = 3) -> tuple[int, str]:
+    """Fetch arXiv with up to `retries` attempts on transient errors."""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            status, _, body = http_get(ARXIV_API, params=params,
+                                        rate_limiter=_LIMITER, cache_ttl=86400)
+            return status, body
+        except (Exception,) as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(2.0 * (attempt + 1))
+                continue
+    return 0, ""
+
+
 def search(query: str, *, max_results: int = 20,
            year_from: Optional[int] = None,
            year_to: Optional[int] = None) -> list[dict]:
+    """Search arXiv with optional NOT-clause.
+
+    arXiv's search_query supports ``NOT:`` prefix for negation.
+    We parse NOT-clauses from the incoming query and convert them
+    to arXiv's ``NOT:`` syntax in the abstract field.
+    """
+    not_terms: list[str] = []
+    q = query
+    for m in re.finditer(r'\bNOT\s+(\S+)', q):
+        not_terms.append(m.group(1))
+    clean_query = re.sub(r'\s*NOT\s+\S+', '', q).strip()
+
+    # Build the base query
+    base = f"all:{clean_query}"
+    # Append NOT clauses (arXiv supports NOT: in search_query)
+    for nt in not_terms:
+        base += f" AND NOT:{nt}"
+
     params = {
-        "search_query": f"all:{query}",
+        "search_query": base,
         "start": 0,
         "max_results": max_results,
         "sortBy": "relevance",
         "sortOrder": "descending",
     }
-    status, _, body = http_get(
-        ARXIV_API, params=params, rate_limiter=_LIMITER, cache_ttl=86400,
-    )
+    status, body = _fetch_with_retry(params)
     if status != 200:
         return []
     try:

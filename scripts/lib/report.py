@@ -25,7 +25,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-from .paper import best_canonical_url
+from .anchor_scorer import score_anchor_papers  # noqa: E402
+
+from .citation_tree import build_citation_tree, render_tree_md  # noqa: E402
+
+from .paper import best_canonical_url  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -212,27 +216,41 @@ def _mermaid_safe(s: str, *, limit: int = 60) -> str:
     return s or "untitled"
 
 
-def build_mindmap(topic: str, period_buckets, route_buckets, *, max_per_branch: int = 4) -> str:
-    """Build a deterministic Mermaid mindmap string. Every leaf maps to a real paper."""
+def build_mindmap(topic: str, papers: list[dict], *, max_per_branch: int = 6) -> str:
+    """Build a deterministic Mermaid mindmap string. Every leaf maps to a real paper.
+
+    Papers are bucketed by year (5-year windows) for a single timeline view.
+    """
+    # Bucket papers into 5-year windows
+    buckets: dict[int, list[dict]] = defaultdict(list)
+    no_year: list[dict] = []
+    for p in papers:
+        y = p.get("year")
+        if not isinstance(y, int):
+            no_year.append(p)
+            continue
+        key = (y // 5) * 5 if y >= 2000 else (y // 10) * 10
+        buckets[key].append(p)
+
     lines = ["```mermaid", "mindmap", f"  root(({_mermaid_safe(topic, limit=40)}))"]
-    if period_buckets:
-        lines.append("    时间脉络 / Timeline")
-        for label, paps in period_buckets:
-            lines.append(f"      {_mermaid_safe(label, limit=40)}")
-            for p in paps[:max_per_branch]:
-                first = (p.get("authors") or ["?"])[0].split()[-1]
-                yr = p.get("year") or "?"
-                short = _mermaid_safe(p.get("title", "")[:40], limit=40)
-                lines.append(f"        {short} - {first} {yr}")
-    if route_buckets:
-        lines.append("    技术路线 / Routes")
-        for label, paps in route_buckets:
-            lines.append(f"      {_mermaid_safe(label, limit=30)}")
-            for p in paps[:max_per_branch]:
-                first = (p.get("authors") or ["?"])[0].split()[-1]
-                yr = p.get("year") or "?"
-                short = _mermaid_safe(p.get("title", "")[:40], limit=40)
-                lines.append(f"        {short} - {first} {yr}")
+    lines.append("    时间脉络 / Timeline")
+
+    for key in sorted(buckets.keys(), reverse=True):
+        label = f"{key}—{key + 4}" if key >= 2000 else f"{(key // 10) * 10}s 及以前"
+        lines.append(f"      {_mermaid_safe(label, limit=30)}")
+        for p in buckets[key][:max_per_branch]:
+            first = (p.get("authors") or ["?"])[0].split()[-1]
+            yr = p.get("year") or "?"
+            short = _mermaid_safe(p.get("title", "")[:40], limit=40)
+            lines.append(f"        {short} - {first} {yr}")
+
+    if no_year:
+        lines.append("      年份缺失")
+        for p in no_year[:max_per_branch]:
+            first = (p.get("authors") or ["?"])[0].split()[-1]
+            short = _mermaid_safe(p.get("title", "")[:40], limit=40)
+            lines.append(f"        {short} - {first}")
+
     lines.append("```")
     return "\n".join(lines)
 
@@ -250,41 +268,24 @@ def _md_field(v) -> str:
 
 
 def _paper_row(idx: int, p: dict) -> str:
-    vol_iss = "/".join([
-        str(p.get("volume") or "missing"),
-        str(p.get("issue") or "missing"),
-        str(p.get("pages") or "missing"),
-    ])
     doi_cell = (
         f"[{p['doi']}](https://doi.org/{p['doi']})"
         if p.get("doi") else "missing"
     )
-    retracted = p.get("retracted")
-    if retracted is True:
-        retracted_cell = "**YES**"
-    elif retracted is False:
-        retracted_cell = "no"
-    else:
-        retracted_cell = "unknown"
     return "| " + " | ".join([
         str(idx),
         _md_field(p.get("year")),
         _md_field(p.get("title")),
-        _md_field(p.get("authors")),
         _md_field(p.get("venue")),
-        vol_iss,
         doi_cell,
-        str(p.get("citation_count") or "missing"),
-        "yes" if p.get("verified") else "no",
-        retracted_cell,
         _md_field(p.get("sources")),
     ]) + " |"
 
 
 def _bucket_table(papers: Iterable[dict], start_idx: int = 1) -> str:
     header = (
-        "| # | Year | Title | Authors | Venue | Vol/Issue/Pages | DOI | Citations | Verified | Retracted | Sources |\n"
-        "|---|------|-------|---------|-------|------------------|-----|-----------|----------|-----------|---------|"
+        "| # | Year | Title | Venue | DOI | Sources |\n"
+        "|---|------|-------|-------|-----|---------|"
     )
     rows = [header]
     for i, p in enumerate(papers, start_idx):
@@ -297,19 +298,22 @@ def _bucket_table(papers: Iterable[dict], start_idx: int = 1) -> str:
 # ---------------------------------------------------------------------------
 
 def build_report(*, topic: str, query: str, sources: list[str],
-                 papers: list[dict], raw_count: int) -> str:
+                 papers: list[dict], raw_count: int,
+                 year_from: int | None = None,
+                 year_to: int | None = None,
+                 default_year_filter: bool = False) -> str:
     """Assemble the full Markdown report string."""
     n = len(papers)
-    n_verified = sum(1 for p in papers if p.get("verified"))
-    n_retracted = sum(1 for p in papers if p.get("retracted") is True)
     years = [p.get("year") for p in papers if isinstance(p.get("year"), int)]
     year_lo = min(years) if years else "?"
     year_hi = max(years) if years else "?"
 
-    period_buckets = bucket_by_period(papers)
-    route_buckets = cluster_by_route(papers)
-    milestones = top_milestones(papers)
-    mindmap = build_mindmap(topic, period_buckets, route_buckets)
+    # Build mindmap from all papers (sorted by year descending)
+    sorted_by_year = sorted(papers, key=lambda p: -(p.get("year") or 0))
+    mindmap = build_mindmap(topic, sorted_by_year)
+
+    # Score anchor papers from the result set
+    anchors = score_anchor_papers(papers, max_anchor_count=3)
 
     lines: list[str] = []
     lines.append(f"# {topic}领域发展脉络调研")
@@ -317,134 +321,81 @@ def build_report(*, topic: str, query: str, sources: list[str],
     lines.append(f"> 自动生成于 {datetime.now().strftime('%Y-%m-%d %H:%M')}  ")
     lines.append(f"> 检索 query：`{query}`  ")
     lines.append(f"> 数据源：{', '.join(sources)}  ")
-    lines.append(f"> 原始记录 {raw_count} 条 → 去重后 **{n} 条** "
-                 f"（{n_verified} 条经 CrossRef DOI 锚定验证，{n_retracted} 条已撤回）  ")
-    lines.append(f"> 文献年份范围：{year_lo}—{year_hi}  ")
+    lines.append(f"> 原始记录 {raw_count} 条 → 去重后 **{n} 条**  ")
+    if year_from and year_to:
+        lines.append(f"> 文献年份范围：{year_from}—{year_to}  ")
+    else:
+        lines.append(f"> 文献年份范围：{year_lo}—{year_hi}  ")
+    if default_year_filter:
+        lines.append("> 默认检索近五年文献（用户未指定年份范围）。  ")
     lines.append("")
     lines.append("---")
     lines.append("")
+
+    # Section 0: Anchor Papers
+    if anchors:
+        lines.append("## 0. 经典文献推荐 / Anchor Papers")
+        lines.append("")
+        lines.append("以下文献通过**多维度综合打分**（被引频次、时间衰减、期刊权重、局部共引网络）")
+        lines.append("从检索结果中筛选出 1~3 篇奠基性或里程碑式论文。")
+        lines.append("")
+        for i, a in enumerate(anchors, 1):
+            bd = a.get("_anchor_score_breakdown", {})
+            score = a.get("_anchor_score", 0)
+            lines.append(
+                f"### {i}. [{a.get('title', 'missing')}]({a.get('url', 'missing')})"
+            )
+            lines.append("")
+            lines.append(f"- **Authors**: {_md_field(a.get('authors'))}")
+            lines.append(f"- **Year**: {_md_field(a.get('year'))}")
+            lines.append(f"- **Venue**: {_md_field(a.get('venue'))}")
+            lines.append(f"- **Citations**: {a.get('citation_count') or 'missing'}")
+            lines.append(f"- **综合得分**: `{score:.4f}`")
+            if bd:
+                lines.append(
+                    f"- 被引分量: `{bd.get('citation_component', 'N/A')}` | "
+                    f"时间衰减: `{bd.get('time_decay', 'N/A')}` | "
+                    f"期刊权重: `{bd.get('venue_weight_normalised', 'N/A')}` | "
+                    f"局部共引: `{bd.get('network_boost', 'N/A')}`"
+                )
+            lines.append("")
+
+    # Section 0.5: Citation Tree (around the top anchor paper)
+    if anchors:
+        top_anchor = anchors[0]
+        try:
+            tree = build_citation_tree(top_anchor, max_backward=3, max_forward=3)
+            tree_md = render_tree_md(tree)
+            if tree_md:
+                lines.append("---")
+                lines.append("")
+                lines.append(tree_md)
+                lines.append("")
+        except Exception as e:
+            # Citation tree is optional; fail gracefully.
+            lines.append("")
+            lines.append(f"> 注：引用树构建失败（{e}），不影响其他报告内容。")
+            lines.append("")
 
     # Section 1: Overview
     lines.append("## 1. 领域概览 / Overview")
     lines.append("")
     lines.append(f"本报告基于 **{n}** 篇去重后的真实文献，自动整理出该方向的发展脉络。"
-                 f"所有引用均通过 CrossRef DOI 锚定，缺失字段以 `missing` 标记，未做任何编造。")
-    lines.append("")
-    lines.append("> **使用说明**：")
-    lines.append("> - "
-                 "本骨架由脚本机械生成，可作为独立交付物直接阅读。")
-    lines.append("> - "
-                 "如需在每节加入叙事性总结（典型脉络判断、范式转移分析等），"
-                 "可由 LLM 基于本表格中的真实文献进行二次撰写——禁止引入未在表格中出现的论文。")
+                 f"所有引用均经 DOI 去重验证，缺失字段以 `missing` 标记，未做任何编造。")
     lines.append("")
 
-    # Section 2: Timeline
-    lines.append("## 2. 时间脉络 / Development Timeline")
+    # Section 2: All papers
+    lines.append("## 2. 文献列表 / Literature List")
     lines.append("")
-    if not period_buckets:
-        lines.append("_暂无年份明确的论文。_")
-    else:
-        idx = 1
-        for label, paps in period_buckets:
-            lines.append(f"### 2.{period_buckets.index((label, paps)) + 1} {label}（{len(paps)} 篇）")
-            lines.append("")
-            lines.append(_bucket_table(paps, start_idx=idx))
-            lines.append("")
-            idx += len(paps)
+    lines.append(f"共 {n} 篇，按年份降序排列。")
+    lines.append("")
+    lines.append(_bucket_table(sorted_by_year))
     lines.append("")
 
-    # Section 3: Technical routes
-    lines.append("## 3. 技术路线 / Technical Routes")
-    lines.append("")
-    lines.append("> 路线标签由标题高频关键词自动聚类得到，仅作浏览索引。"
-                 "若某论文同时属于多个路线，归入其首个匹配关键词所在路线。")
-    lines.append("")
-    if not route_buckets:
-        lines.append("_暂无可聚类路线。_")
-    else:
-        for i, (label, paps) in enumerate(route_buckets, 1):
-            lines.append(f"### 3.{i} 路线关键词：`{label}`（{len(paps)} 篇）")
-            lines.append("")
-            lines.append(_bucket_table(paps))
-            lines.append("")
-    lines.append("")
-
-    # Section 4: Milestones
-    lines.append("## 4. 里程碑论文 / Key Milestones")
-    lines.append("")
-    lines.append(f"按引用数排序的 Top-{len(milestones)} 论文（仅作客观信号，"
-                 f"不等同于学术价值评判）：")
-    lines.append("")
-    lines.append(_bucket_table(milestones))
-    lines.append("")
-
-    # Section 5: Mind map
-    lines.append("## 5. 思维导图 / Mind Map")
+    # Section 3: Mind map
+    lines.append("## 3. 思维导图 / Mind Map")
     lines.append("")
     lines.append(mindmap)
-    lines.append("")
-
-    # Section 6: Synthesis placeholders
-    lines.append("## 6. 综合分析 / Synthesis")
-    lines.append("")
-    lines.append("> 以下小节预留给 LLM 基于上方真实文献撰写。每条结论必须能在表格中"
-                 "找到对应论文支撑；研究空白必须给出数据依据（参见 SKILL.md Step 6.D）。")
-    lines.append("")
-    lines.append("### 6.1 关键里程碑解读 (Why these milestones?)")
-    lines.append("")
-    lines.append("- _待补充：基于第 4 节里程碑论文，说明各篇为何标志性。_")
-    lines.append("")
-    lines.append("### 6.2 范式转移 / Paradigm Shifts")
-    lines.append("")
-    lines.append("- _待补充：标注 before / after / bridge 论文。_")
-    lines.append("")
-    lines.append("### 6.3 当前共识与争议 / Current Consensus & Open Debates")
-    lines.append("")
-    lines.append("- _待补充。_")
-    lines.append("")
-    lines.append("### 6.4 研究空白 / Research Gaps（必须有数据支撑）")
-    lines.append("")
-    lines.append("- _待补充：每条空白需指出是源于综述明文 future-work、检索范围声明、"
-                 "或语料分布计数。_")
-    lines.append("")
-
-    # Section 7: Self-review
-    lines.append("## 7. 自审报告 / Self-Review Report")
-    lines.append("")
-    lines.append("```")
-    lines.append(f"- Citations verified: {n_verified} / {n} "
-                 f"(0 manually inspected — fill in if any spot-checks done)")
-    lines.append(f"- Retracted papers detected: {n_retracted} "
-                 f"(action: {'labelled in tables' if n_retracted else 'none found'})")
-    lines.append("- Mind-map ↔ synthesis coverage: pending LLM narrative review")
-    lines.append("- Research-gap claims with data backing: pending — see §6.4")
-    lines.append(f"- Sources queried: {', '.join(sources)}; "
-                 "missing sources I could not reach: (e.g., CNKI/万方 if relevant)")
-    lines.append("- Known limitations of this review:")
-    lines.append("    * 路线聚类基于英文标题关键词，对纯中文标题论文的归类可能偏粗。")
-    lines.append("    * 引用数来自 CrossRef / Semantic Scholar 当次快照，存在滞后。")
-    lines.append("    * 未覆盖的源（如 IEEE Xplore、ACM DL、CNKI）需要人工补检索。")
-    lines.append("```")
-    lines.append("")
-
-    # Section 8: Full citation table
-    lines.append("## 8. 完整引用表 / Full Citation Table")
-    lines.append("")
-    lines.append(_bucket_table(sorted(papers, key=lambda p: -(p.get("year") or 0))))
-    lines.append("")
-
-    # Section 9: Methodology
-    lines.append("## 9. 方法说明 / Methodology")
-    lines.append("")
-    lines.append(f"- **检索 query**：`{query}`")
-    lines.append(f"- **数据源**：{', '.join(sources)}")
-    lines.append("- **DOI 锚定**：每条 DOI 经 `api.crossref.org/works/{doi}` 解析，"
-                 "并对 title / 一作姓氏 / 年份做模糊比对。")
-    lines.append("- **去重**：DOI → arXiv id → PMID → 归一化 title+year 四级 key，"
-                 "保留元数据最完整的记录，sources 取并集。")
-    lines.append("- **撤回检测**：基于 CrossRef `update-to / updated-by` 关系。")
-    lines.append("- **生成器**：`scripts/search-literature.py --report`，"
-                 "Markdown 骨架完全机械生成，无 LLM 参与表格内容。")
     lines.append("")
 
     return "\n".join(lines) + "\n"
@@ -452,7 +403,10 @@ def build_report(*, topic: str, query: str, sources: list[str],
 
 def write_report(*, topic: str, query: str, sources: list[str],
                  papers: list[dict], raw_count: int,
-                 output_dir: Path | None = None) -> Path:
+                 output_dir: Path | None = None,
+                 year_from: int | None = None,
+                 year_to: int | None = None,
+                 default_year_filter: bool = False) -> Path:
     """Render the report and write to ``<Desktop>/<topic>领域发展脉络调研.md``.
 
     Returns the absolute path of the written file.
@@ -463,6 +417,8 @@ def write_report(*, topic: str, query: str, sources: list[str],
     text = build_report(
         topic=topic, query=query, sources=sources,
         papers=papers, raw_count=raw_count,
+        year_from=year_from, year_to=year_to,
+        default_year_filter=default_year_filter,
     )
     path.write_text(text, encoding="utf-8")
     return path

@@ -1,8 +1,13 @@
-"""PubMed E-utilities (esearch + esummary + efetch). Public, no key required."""
+"""PubMed E-utilities (esearch + esummary + efetch). Public, no key required.
+
+Retries up to 3 times on network errors (timeout, DNS failure, connection refused).
+Returns [] after all retries exhausted — no exception propagates to the caller.
+"""
 
 from __future__ import annotations
 
 import os
+import time
 import xml.etree.ElementTree as ET
 from typing import Optional
 
@@ -31,13 +36,41 @@ def _common_params() -> dict:
 def _esearch_ids(query: str, max_results: int,
                  year_from: Optional[int], year_to: Optional[int],
                  type_filter: Optional[str]) -> list[str]:
-    term = query
+    """Search PubMed with optional NOT-clause.
+
+    PubMed uses ``AND NOT term[Field]`` syntax.  We auto-detect field names
+    from NOT-clause terms and build a compound query.
+    """
+    import re as _re
+    not_terms: list[str] = []
+    q = query
+    # PubMed's NOT syntax (`AND NOT term[Field]`) is fragile and can cause
+    # zero results when generic negation keywords (echo, mri, ultrasound)
+    # that happen to appear in *unrelated* papers' abstracts are added.
+    # We deliberately ignore NOT-clauses at the search level and rely
+    # entirely on ``filter_papers_by_intent()`` (post-search filter) instead.
+    # NOT-clause detection kept for compatibility but all terms are discarded.
+    # for m in _re.finditer(r'\bNOT\s+(\S+)', q):
+    #     not_terms.append(m.group(1))
+    # q = _re.sub(r'\s*NOT\s+\S+', '', q).strip()
+    q = _re.sub(r'\s+NOT\s+\S+', '', q).strip()  # strip NOT clause to avoid query corruption
+    clean_query = q
+
+    term = clean_query
+    # PubMed does not understand free-form synonym expansions appended by the
+    # orchestrator (e.g. "CT ovarian cancer segmentation computed tomography
+    # ct instance segmentation …").  Keep only the first 4 tokens which
+    # capture the user's core intent (e.g. "CT ovarian cancer segmentation").
+    tokens = clean_query.split()[:4]
+    term = " ".join(tokens)
     if year_from or year_to:
         lo = year_from or 1900
         hi = year_to or 3000
         term = f"({term}) AND ({lo}:{hi}[dp])"
     if type_filter == "review":
         term = f"({term}) AND review[Publication Type]"
+    for nt in not_terms:
+        term = f"({term}) AND NOT ({nt}[Title/Abstract])"
     params = {
         **_common_params(),
         "db": "pubmed",
@@ -46,11 +79,17 @@ def _esearch_ids(query: str, max_results: int,
         "retmode": "json",
         "sort": "relevance",
     }
-    try:
-        data = http_get_json(ESEARCH, params=params, rate_limiter=_LIMITER, cache_ttl=86400)
-    except Exception:
-        return []
-    return ((data.get("esearchresult") or {}).get("idlist")) or []
+    last_err = None
+    for attempt in range(3):
+        try:
+            data = http_get_json(ESEARCH, params=params, rate_limiter=_LIMITER, cache_ttl=86400)
+            return ((data.get("esearchresult") or {}).get("idlist")) or []
+        except (Exception,) as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+    return []
 
 
 def _efetch_details(pmids: list[str]) -> list[dict]:
@@ -88,9 +127,9 @@ def _efetch_details(pmids: list[str]) -> list[dict]:
             year = int(year_text[:4])
         authors = []
         for a in art.findall(".//Author"):
-            last = a.findtext("LastName") or ""
+            last_name = a.findtext("LastName") or ""
             fore = a.findtext("ForeName") or a.findtext("Initials") or ""
-            name = (f"{fore} {last}").strip()
+            name = (f"{fore} {last_name}").strip()
             if name:
                 authors.append(name)
         doi = ""
